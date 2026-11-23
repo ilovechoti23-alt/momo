@@ -1941,7 +1941,8 @@ const DEFAULT_STATE = {
   stats:{},
   chatRead:0,
   days:{},
-  focus:{today:0}
+  focus:{today:0},
+  stateTs:0
 };
 let S = null;
 let MSG = [];
@@ -1967,11 +1968,156 @@ function loadState(){
   }catch(e){ console.warn('state parse', e); }
   return JSON.parse(JSON.stringify(DEFAULT_STATE));
 }
+/* ================= 가족 상태 실시간 동기화 (공유 상태만 · E2EE) =================
+   공유(기기끼리 같은 값): routine, routines, hs, hsDone, deeds, ledger, books,
+                          age, stones, stats, events
+   기기 전용(원격으로 절대 덮어쓰지 않음): me, syncRoom, set, chatRead
+   순서 보장: S.stateTs (LWW). 새 기기는 0 에서 시작해 sync-res 로 따라잡는다.
+*/
+const SHARED_KEYS=['routine','routines','hs','hsDone','deeds','ledger','books','age','stones','stats','events'];
+let applyingRemote=false, sharedSnap='', statePubTimer=null, statePubCount=0, stateApplyCount=0, booting=true;
+
+function extractSharedState(){
+  const o={};
+  if(!S) return o;
+  SHARED_KEYS.forEach(k=>{ if(S[k]!==undefined) o[k]=S[k]; });
+  return o;
+}
+function sharedJSON(){ try{ return JSON.stringify(extractSharedState()); }catch(e){ return ''; } }
+
+/* 공유 상태가 실제로 들어 있는지 (빈 기기와 데이터 있는 기기를 구분) */
+function hasSharedData(st){
+  const x = st || extractSharedState();
+  try{
+    const inner=o=>!!o && typeof o==='object' && Object.values(o).some(v=>v && typeof v==='object' && Object.keys(v).length>0);
+    if(inner(x.routine)) return true;
+    if(inner(x.hsDone)) return true;
+    if(x.ledger && x.ledger.length) return true;
+    if(x.events && x.events.length) return true;
+    if(x.stats && Object.keys(x.stats).length) return true;
+    if(x.deeds && ((x.deeds.missions||[]).length>6 || Object.keys(x.deeds.counts||{}).length || Object.keys(x.deeds.settled||{}).length)) return true;
+    if(x.books && (x.books.total || Object.keys(x.books.week||{}).length || Object.keys(x.books.days||{}).length)) return true;
+    if(x.age && ((x.age.months!==1200) || (x.age.log||[]).length || Object.keys(x.age.tokens||{}).length)) return true;
+    if(x.stones && (x.stones.count || x.stones.total)) return true;
+  }catch(e){}
+  return false;
+}
+/* 기록의 양 — 업데이트 직후 첫 만남에서 '더 많이 쌓인 쪽'을 기준으로 삼기 위한 점수 */
+function sharedScore(x){
+  const st = x || extractSharedState();
+  const cnt=o=>{ try{ return Object.values(o||{}).reduce((a,v)=>a+((v&&typeof v==='object')?Object.keys(v).length:0),0); }catch(e){ return 0; } };
+  let n=0;
+  try{
+    n += cnt(st.routine);
+    n += cnt(st.hsDone);
+    n += ((st.ledger||[]).length)*2;
+    n += ((st.events||[]).length)*2;
+    n += Object.keys(st.stats||{}).length;
+    n += Object.values((st.deeds&&st.deeds.counts)||{}).reduce((a,v)=>a+(v||0),0)*2;
+    n += Object.keys((st.deeds&&st.deeds.settled)||{}).length;
+    n += ((st.age&&st.age.log)||[]).length;
+    n += Math.max(0,1200-((st.age&&st.age.months)||1200))/12;
+    n += Object.values((st.books&&st.books.week)||{}).reduce((a,v)=>a+(v||0),0);
+    n += (st.stones&&st.stones.count)||0;
+  }catch(e){}
+  return n;
+}
+/* 이 원격 상태를 받아들일지 (LWW + 빈 상태가 찬 상태를 덮지 않게 + 첫 만남은 기록이 많은 쪽) */
+function shouldTakeRemote(ts, data){
+  const cur=S.stateTs||0;
+  const mineHas=hasSharedData(), theirsHas=hasSharedData(data);
+  if(cur>0 && ts<=cur) return false;            /* 내가 더 새로움 */
+  if(!theirsHas && mineHas) return false;        /* 빈 상태가 찬 상태를 덮지 않음 */
+  if(cur===0 && mineHas && theirsHas){
+    return sharedScore(data) >= sharedScore();   /* 업데이트 직후: 더 많이 쌓인 쪽을 따른다 */
+  }
+  return theirsHas || !mineHas;
+}
+/* 다른 기기의 상태 반영 — stateTs 는 '받은 값'으로 고정(현지 시각으로 올리지 않음 → 메아리 방지) */
+function applySharedState(data, ts){
+  if(!data || typeof data!=='object') return false;
+  /* 기기 시계가 많이 앞서 있어도 다시 되돌릴 수 있게 현재 시각 근처로 자른다 */
+  const stamp=Math.min(Math.max(Number(ts)||0,0), Date.now()+50);
+  applyingRemote=true;
+  let changed=false;
+  SHARED_KEYS.forEach(k=>{
+    if(!Object.prototype.hasOwnProperty.call(data,k)) return;
+    const v=data[k];
+    if(v===undefined || v===null) return;
+    let a='', b='';
+    try{ a=JSON.stringify(S[k]); b=JSON.stringify(v); }catch(e){ return; }
+    if(a!==b){ S[k]=v; changed=true; }
+  });
+  S.stateTs=stamp;
+  try{ save(); }catch(e){}          /* 저장은 하되 재브로드캐스트는 없음(noteSharedChange 가 막는다) */
+  applyingRemote=false;
+  if(changed) stateApplyCount++;
+  return changed;
+}
+
+/* 로컬 변경 감지 — save() 를 부르는 모든 동작(루틴·홈스쿨·착한일·기입장·독서·나이·스톤·일정·통계)을 한 곳에서 잡는다 */
+function noteSharedChange(){
+  if(applyingRemote){ sharedSnap=sharedJSON(); return; }
+  if(booting){ sharedSnap=sharedJSON(); return; }   /* 부팅 중 기본값 보정·과거 정산은 전송하지 않음 */
+  const j=sharedJSON();
+  if(j===sharedSnap) return;        /* 기기 전용 설정만 바뀐 경우 등 → 알리지 않음 */
+  sharedSnap=j;
+  /* 아직 아무 공유 데이터도 없고 시각도 0 인 기기는 알리지 않는다(부팅 잡음 방지) */
+  if(!hasSharedData() && !(S.stateTs>0)) return;
+  S.stateTs=Date.now();
+  if(statePubTimer) return;         /* 짧게 모아서 한 번만 전송 */
+  statePubTimer=setTimeout(()=>{
+    statePubTimer=null;
+    try{
+      ensureDev();
+      statePubCount++;
+      broadcast({t:'state',ts:S.stateTs,data:extractSharedState()});
+    }catch(e){}
+  },120);
+}
+
+/* 복원·가져오기처럼 즉시 알려야 할 때 */
+function pushStateNow(){
+  if(applyingRemote) return;
+  sharedSnap=sharedJSON();
+  S.stateTs=Date.now();
+  try{ save(); }catch(e){}
+  try{ ensureDev(); statePubCount++; broadcast({t:'state',ts:S.stateTs,data:extractSharedState()}); }catch(e){}
+}
+
+/* 원격 반영 뒤 화면 갱신 — 열려 있는 모달의 내용까지 새로 그린다 */
+function refreshAfterRemote(){
+  try{ renderAll(); }catch(e){}
+  try{
+    const ov=$('#ovAllow');
+    if(ov && ov.classList.contains('show')){
+      const on=$('#allowTabs .on');
+      const at=on?on.dataset.at:'deed';
+      if(at==='ledger') renderPaneLedger();
+      else if(at==='stats') renderPaneStats();
+      else renderPaneDeed(true);       /* 스크롤 위치 유지 */
+    }
+    if($('#ovRead') && $('#ovRead').classList.contains('show')) renderReading();
+    if($('#ovAge') && $('#ovAge').classList.contains('show')) renderAge();
+    if($('#ovStone') && $('#ovStone').classList.contains('show')){
+      renderStoneBar(); renderStonePopup(); renderAge();
+    }
+    if($('#ovCal') && $('#ovCal').classList.contains('show')) renderCalendar();
+  }catch(e){}
+}
+window.__sync={extract:extractSharedState, apply:applySharedState, push:pushStateNow, refresh:refreshAfterRemote, save,
+  get state(){ return S; },
+  get ts(){ return S?S.stateTs:0; }, get pub(){ return statePubCount; }, get applied(){ return stateApplyCount; },
+  get keys(){ return SHARED_KEYS.slice(); }};
+
 function save(){
   try{ localStorage.setItem(LS, JSON.stringify(S)); }catch(e){ console.warn('save fail', e); }
+  noteSharedChange();
 }
 S = loadState();
+if(!S.stateTs) S.stateTs = 0;
 if(!S.start) S.start = todayKey();
+sharedSnap = sharedJSON();          /* 첫 저장은 기준점으로만 (부팅 직후 불필요한 전송 없음) */
 
 /* ---------------- 날짜 ---------------- */
 function now(){ return new Date(); }
@@ -3271,6 +3417,11 @@ const Relay={
     try{ this.ws.send(mqttFrame(0x30,[...mqttStr(this.topic()),...new TextEncoder().encode(payload)])); return true; }catch(e){ return false; }
   },
   publishJSON(str){ return this.sendStr(str); },
+  /* 따라잡기 응답 — 대화·프로필·일정 + 공유 상태 전체 */
+  syncRes(to){
+    this.publish({t:'sync-res',to,msgs:MSG.slice(-80),profiles:S.profiles,events:S.events,
+      stateTs:S.stateTs||0,state:extractSharedState()});
+  },
   onData(data){
     const buf=typeof data==='string'?new TextEncoder().encode(data):new Uint8Array(data);
     let off=0;
@@ -3290,6 +3441,7 @@ const Relay={
     if(!p||p.dev===this.dev) return;
     if(p.from&&p.dev){ PEERS[p.from]=Date.now(); }
     if(p.t==='hello'||p.t==='presence'){ renderProfiles(); }
+    if(p.t==='hello'){ this.syncRes(p.from); }   /* 새 기기가 붙으면 바로 상태를 밀어 준다(sync-req 유실 대비) */
     if(p.t==='chunk'){
       const c=CHUNKS[p.cid]||(CHUNKS[p.cid]={n:p.n,parts:[],at:Date.now()});
       c.parts[p.i]=p.d;
@@ -3310,15 +3462,26 @@ const Relay={
         else { showTalkBanner(m); chime('talk'); }
       }
     }
-    if(p.t==='sync-req'){
-      const msgs=MSG.slice(-80);
-      this.publish({t:'sync-res',to:p.from,msgs,profiles:S.profiles,events:S.events});
+    if(p.t==='state'&&p.data){
+      /* 다른 기기의 공유 상태 — 더 새로운 것만 반영 (텍스트는 이미 복호화된 JSON) */
+      const ts=Number(p.ts)||0;
+      if(shouldTakeRemote(ts, p.data)){
+        if(applySharedState(p.data, ts)) refreshAfterRemote();
+      }
     }
+    if(p.t==='sync-req'){ this.syncRes(p.from); }
     if(p.t==='sync-res'){
       let added=0;
       (p.msgs||[]).forEach(m=>{ if(m.id&&!MSG.some(x=>x.id===m.id)){ MSG.push(m); idbPut('msgs',m); added++; } });
       if(added){ MSG.sort((a,b)=>a.ts-b.ts); renderChat(); renderChatBadge(); renderSchedule(); }
       if(p.profiles) mergeProfiles(p.profiles);
+      /* 따라잡기 — 새 기기(stateTs 0)도 여기서 전체 공유 상태를 받는다 */
+      if(p.state){
+        const ts=Number(p.stateTs)||0;
+        if(shouldTakeRemote(ts, p.state)){
+          if(applySharedState(p.state, ts)) refreshAfterRemote();
+        }
+      }
     }
     if(p.t==='profile'&&p.role&&p.profile){
       if(p.profile.ts>((S.profiles[p.role]||{}).ts||0)){ S.profiles[p.role]=p.profile; save(); renderProfiles(); renderChat(); }
@@ -3614,7 +3777,7 @@ async function restoreBackup(){
   if(!data||!data.state){ toast('복원할 데이터가 없어요'); return; }
   const ok=await ask('복원 확인','이 기기의 대시보드와 대화를 백업 코드 내용으로 바꿀까요?<br><span class="hint">기존 기록은 덮어써집니다.</span>','복원');
   if(!ok) return;
-  S=deepMerge(DEFAULT_STATE,data.state); save();
+  S=deepMerge(DEFAULT_STATE,data.state); save(); pushStateNow();
   if(Array.isArray(data.msgs)){ MSG=data.msgs; await idbClear('msgs'); for(const m of MSG) await idbPut('msgs',m); }
   renderAll(); fillSettings(); loadWeather(); loadMsgs();
   toast('복원 완료! 🎉');
@@ -4277,6 +4440,9 @@ async function boot(){
   if(window.speechSynthesis){ speechSynthesis.onvoiceschanged=pickVoice; pickVoice(); }
   // 화면 복귀 시
   document.addEventListener('visibilitychange',()=>{ if(!document.hidden){ renderClock(); updateNight(); } });
+  booting=false;
+  if(statePubTimer){ clearTimeout(statePubTimer); statePubTimer=null; }
+  sharedSnap=sharedJSON();   /* 부팅 중 기본값 보정은 동기화 기준점으로만 */
 }
 boot();
 
