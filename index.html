@@ -214,6 +214,9 @@ button{font-family:inherit}
 .ageNow{font-size:clamp(26px,3.4vw,38px);font-weight:900;color:var(--emD);letter-spacing:-.02em;line-height:1;display:inline-flex;align-items:baseline;gap:2px}
 .ageNow small{font-size:.52em;font-weight:900;color:var(--emD)}
 .ageNow .mo{font-size:.42em;color:#3f9d7d;margin-left:3px}
+/* v13: 메인 카드 '자기조절력 나이' 옆 남은 개월 수 — 보조 크기(12~13.5px) · 줄바꿈 없이 한 줄 */
+#ageNow{flex-wrap:nowrap;white-space:nowrap}
+#ageNow .mo{font-size:clamp(12px,1vw,13.5px);margin-left:clamp(3px,.35vw,5px);letter-spacing:0;white-space:nowrap}
 .ageNow.big{font-size:clamp(30px,4.4vw,46px)}
 /* 금테 + 에메랄드 크리스탈 게이지 */
 .gauge{position:relative;height:clamp(24px,3.1vw,32px);margin:0}
@@ -2378,6 +2381,9 @@ async function restoreBackupNow(){
 function shouldTakeRemote(ts, data){
   const cur=S.stateTs||0;
   const mineHas=hasSharedData(), theirsHas=hasSharedData(data);
+  /* v13: 내게 누적 기록이 하나도 없으면(새 기기·키오스크) 상대가 가진 기록은
+     시각과 무관하게 받는다. 부팅 때 stateTs 만 앞서 있어도 빈 기기가 기록을 놓치지 않게. */
+  if(!hasAssets() && hasAssets(data)) return true;
   if(cur>0 && ts<=cur) return false;            /* 내가 더 새로움 */
   if(!theirsHas && mineHas) return false;        /* 빈 상태가 찬 상태를 덮지 않음 */
   if(cur===0 && mineHas && theirsHas){
@@ -2496,6 +2502,7 @@ window.__sync={extract:extractSharedState, apply:applySharedState, push:pushStat
   hasAssets, ageIsInit, ledgerIsInit, deedsIsInit, booksIsInit, stonesIsInit,
   merge:mergeSharedKey, backup:backupNow, readBackup, restore:restoreBackupNow,
   get backupAt(){ const b=readBackup(); return b?b.at:0; },
+  urlRoom:()=>urlRoomCode(),
   get state(){ return S; },
   get ts(){ return S?S.stateTs:0; }, get pub(){ return statePubCount; }, get applied(){ return stateApplyCount; },
   get offset(){ return clockOffset; },
@@ -2510,6 +2517,35 @@ if(!S.stateTs) S.stateTs = 0;
 if(!S.start) S.start = todayKey();
 sharedSnap = sharedJSON();          /* 첫 저장은 기준점으로만 (부팅 직후 불필요한 전송 없음) */
 try{ if(!readBackup() && hasAssets()) backupNow(true); }catch(e){}   /* v12: 첫 백업 */
+
+/* ================= v13: 주소의 방 코드 자동 연결 (?room=0520 · #room=0520) =================
+   윈도우 키오스크처럼 localStorage 가 매번 비워지는 기기에서도
+   https://ilovechoti23-alt.github.io/momo/?room=0520 으로 열면 방 코드를 다시 넣지 않아도
+   그 방에 붙는다. 주소의 값이 저장된 방 코드보다 우선하고, 동기화도 함께 켠다.
+   (방 코드는 기기 전용 값이라 가족 기기로 전송되지 않는다) */
+function urlRoomCode(){
+  let raw='';
+  try{
+    const q=new URLSearchParams(String(location.search||'').replace(/^\?/,''));
+    raw=q.get('room')||'';
+    if(!raw){
+      let h=String(location.hash||'').replace(/^#/,'');
+      try{ h=decodeURIComponent(h); }catch(e){}
+      raw=(new URLSearchParams(h)).get('room')||'';
+      if(!raw){
+        const m=h.match(/(?:^|[&#?])\s*room\s*=\s*([^&]*)/i);
+        if(m) raw=m[1];
+      }
+    }
+  }catch(e){}
+  return String(raw==null?'':raw).replace(/\s+/g,'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+}
+const URL_ROOM=urlRoomCode();
+if(URL_ROOM){
+  S.syncRoom=URL_ROOM;
+  S.set.syncOn=true;
+  save();          /* ⚙️ 설정 창·다음 실행에도 남도록 */
+}
 
 /* ---------------- 날짜 ---------------- */
 function now(){ return new Date(); }
@@ -2967,7 +3003,8 @@ function renderAge(){
   const y=Math.floor(m/12), r=m%12;
   let inner;
   inner=`${y}<small>세</small>`+(r?`<span class="mo">${r}개월</span>`:'');
-  const el=$('#ageNow'); if(el) el.innerHTML=`${y}<small>세</small>`;   /* 메인 카드는 나이만 */
+  /* v13: 메인 카드에도 남은 개월 수를 작게 (35세 미만은 스티커 1개 = 1개월) */
+  const el=$('#ageNow'); if(el) el.innerHTML=`${y}<small>세</small>`+(r?`<span class="mo">${r}개월</span>`:'');
   const el2=$('#agePopNow'); if(el2) el2.innerHTML=inner;
   const pct=ageGaugePct(m);
   ['#gFill','#gFill2'].forEach(s=>{ const f=$(s); if(f){
@@ -3893,7 +3930,10 @@ const Relay={
         if(applySharedState(p.data, ts)) refreshAfterRemote();
       }
     }
-    if(p.t==='sync-req'){ this.syncRes(p.from); }
+    /* v13: 먼저 켜져 있던 기기도 새로 들어온 기기의 기록을 당겨온다.
+       (빈 노트북이 먼저 켜지고 기록 있는 폰이 나중에 접속하는 경우)
+       back 표시로 한 번만 되물어 에코가 없다. */
+    if(p.t==='sync-req'){ this.syncRes(p.from); if(!p.back) this.publish({t:'sync-req',from:S.me,dev:this.dev,to:p.from,back:1}); }
     if(p.t==='sync-res'){
       let added=0;
       (p.msgs||[]).forEach(m=>{ if(m.id&&!MSG.some(x=>x.id===m.id)){ MSG.push(m); idbPut('msgs',m); added++; } });
